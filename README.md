@@ -1,89 +1,246 @@
-# ACT: Action Chunking with Transformers
+# ACT_adapted
 
-### *New*: [ACT tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing)
-TL;DR: if your ACT policy is jerky or pauses in the middle of an episode, just train for longer! Success rate and smoothness can improve way after loss plateaus.
+A fork of [ACT (Action Chunking with Transformers)](https://tonyzhaozh.github.io/aloha/) extended for master's thesis research. The two core additions relative to the original ACT repo are:
 
-#### Project Website: https://tonyzhaozh.github.io/aloha/
+1. **Joint velocity (`qvel`) as an optional observation input** — the policy encoder receives both joint positions and joint velocities, giving the model direct access to the robot's dynamic state.
+2. **Temporal context window** — instead of a single-timestep observation, the policy receives a window of `context_length` consecutive timesteps of state, velocity, and camera images, letting the model reason over recent history before predicting an action chunk.
 
-This repo contains the implementation of ACT, together with 2 simulated environments:
-Transfer Cube and Bimanual Insertion. You can train and evaluate ACT in sim or real.
-For real, you would also need to install [ALOHA](https://github.com/tonyzhaozh/aloha).
+Both features are controlled entirely through command-line flags and flow end-to-end from data loading through the model forward pass.
 
-### Updates:
-You can find all scripted/human demo for simulated environments [here](https://drive.google.com/drive/folders/1gPR03v05S1xiInoVJn7G7VJ9pDCnxq9O?usp=share_link).
+---
 
+## What changed vs. original ACT
 
-### Repo Structure
-- ``imitate_episodes.py`` Train and Evaluate ACT
-- ``policy.py`` An adaptor for ACT policy
-- ``detr`` Model definitions of ACT, modified from DETR
-- ``sim_env.py`` Mujoco + DM_Control environments with joint space control
-- ``ee_sim_env.py`` Mujoco + DM_Control environments with EE space control
-- ``scripted_policy.py`` Scripted policies for sim environments
-- ``constants.py`` Constants shared across files
-- ``utils.py`` Utils such as data loading and helper functions
-- ``visualize_episodes.py`` Save videos from a .hdf5 dataset
+### `--velocity_control` flag — joint velocity in the observation
 
+When `--velocity_control` is passed, every stage of the pipeline loads and processes `joint_velocity` alongside `joint_position`:
 
-### Installation
+**Data loading (`utils.py` — `EpisodicDataset`):**
+- Reads `states/articulation/robot/joint_velocity` from the HDF5 demo file for every sampled timestep window.
+- Computes per-dimension mean and std for `qvel` in `get_norm_stats` and includes `qvel_mean` / `qvel_std` in the stats dict.
+- Returns a 6-element tuple `(image_data, qpos_data, action_data, is_pad, qvel_data, subtask_label)` when velocity is enabled; a 5-element tuple otherwise.
 
-    conda create -n aloha python=3.8.10
-    conda activate aloha
-    pip install torchvision
-    pip install torch
-    pip install pyquaternion
-    pip install pyyaml
-    pip install rospkg
-    pip install pexpect
-    pip install mujoco==2.3.7
-    pip install dm_control==1.0.14
-    pip install opencv-python
-    pip install matplotlib
-    pip install einops
-    pip install packaging
-    pip install h5py
-    pip install ipython
-    cd act/detr && pip install -e .
+**Training loop (`imitate_episodes.py` — `forward_pass`):**
+- Detects whether the batch has 5 or 6 elements and routes accordingly, passing `qvel_data` to the policy when present.
 
-### Example Usages
+**Policy forward pass (`policy.py` — `ACTPolicy.__call__`):**
+- `qvel` is an optional keyword argument. When provided it is forwarded to the underlying DETR/ACT model so the encoder can consume it alongside `qpos`.
 
-To set up a new terminal, run:
+**Inference (`imitate_episodes.py` — `eval_bc`):**
+- At every timestep, reads `obs['qvel']`, normalises it with `pre_process_qvel`, and passes it to `policy(qpos, curr_image, qvel=qvel)`.
 
-    conda activate aloha
-    cd <path to act repo>
+### `--context_length` flag — multi-timestep observation context
 
-### Simulated experiments
+`context_length` (default: `1`, i.e. original ACT behaviour) controls how many consecutive past timesteps are packed into a single observation.
 
-We use ``sim_transfer_cube_scripted`` task in the examples below. Another option is ``sim_insertion_scripted``.
-To generated 50 episodes of scripted data, run:
+**Data loading (`utils.py` — `EpisodicDataset`):**
+- `qpos`, `qvel`, images, and `subtask_label` are all sliced as `[start_ts : start_ts + context_length]` instead of a single index, producing tensors of shape `(context_length, ...)`.
+- The action chunk target starts at `start_ts + context_length - 1` so predictions are always relative to the *last* timestep in the context window.
+- Padding of the action chunk at episode boundaries is handled correctly regardless of context length.
 
-    python3 record_sim_episodes.py \
-    --task_name sim_transfer_cube_scripted \
-    --dataset_dir <data save dir> \
-    --num_episodes 50
+**Image tensor layout:**
+- With context, images are shaped `(num_cameras, context_length, C, H, W)` — an extra temporal dimension compared to the original `(num_cameras, C, H, W)`. The einsum permutation in `__getitem__` is updated to `b k h w c -> b k c h w` to handle this.
 
-To can add the flag ``--onscreen_render`` to see real-time rendering.
-To visualize the episode after it is collected, run
+**Training (`imitate_episodes.py`):**
+- `context_length` is passed through to `load_data` → `EpisodicDataset` and also stored in `policy_config` so the model architecture knows what to expect.
 
-    python3 visualize_episodes.py --dataset_dir <data save dir> --episode_idx 0
+**Command-line:**
+- `--context_length <int>` (default `1`). Setting it to `1` reproduces original ACT exactly.
 
-To train ACT:
-    
-    # Transfer Cube task
-    python3 imitate_episodes.py \
-    --task_name sim_transfer_cube_scripted \
-    --ckpt_dir <ckpt dir> \
-    --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 8 --dim_feedforward 3200 \
-    --num_epochs 2000  --lr 1e-5 \
-    --seed 0
+### `ChunkedEpisodicDataset.py`
 
+A separate dataset class (`ChunkedEpisodicDataset`) that pre-segments episodes into fixed-length chunks at load time. This is an alternative to the random-window sampling in `EpisodicDataset` and is imported in `utils.py`.
 
-To evaluate the policy, run the same command but add ``--eval``. This loads the best validation checkpoint.
-The success rate should be around 90% for transfer cube, and around 50% for insertion.
-To enable temporal ensembling, add flag ``--temporal_agg``.
-Videos will be saved to ``<ckpt_dir>`` for each rollout.
-You can also add ``--onscreen_render`` to see real-time rendering during evaluation.
+### Subtask label encoding
 
-For real-world data where things can be harder to model, train for at least 5000 epochs or 3-4 times the length after the loss has plateaued.
-Please refer to [tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing) for more info.
+Both dataset classes compute a 4-dimensional one-hot subtask label per timestep based on detected gripper state transitions (open/close events detected from `obs/gripper_pos`). These labels are passed to the policy as `subtask_label` and forwarded to the ACT model to provide a coarse task-progress signal.
 
+### Beta-scheduled KL loss (`policy.py`)
+
+The KL divergence term is annealed via a sigmoid schedule rather than a fixed `kl_weight`. `beta` starts at 0 and smoothly ramps to 1 over training, centred at epoch 2500:
+
+```python
+beta = min(1.0, 1.0 / (1.0 + np.exp(-(epoch - 2500) / 500)))
+loss = l1 + beta * total_kld[0]
+```
+
+### Image augmentation (`imitate_episodes.py`)
+
+When `--image_aug` is passed, colour jitter and Gaussian blur are applied to camera 0, and colour jitter + Gaussian blur + random crop to camera 1. Augmentation is applied stochastically (25% of batches) to avoid over-regularising. The augmentation function handles the full `(batch, num_cameras, context_length, C, H, W)` tensor layout introduced by the context window.
+
+---
+
+## Installation
+
+```bash
+conda create -n act_adapted python=3.8.10
+conda activate act_adapted
+pip install torchvision torch
+pip install pyquaternion pyyaml rospkg pexpect
+pip install mujoco==2.3.7 dm_control==1.0.14
+pip install opencv-python matplotlib einops packaging h5py ipython tqdm
+cd detr && pip install -e .
+```
+
+---
+
+## Training
+
+### Baseline (original ACT behaviour, no velocity, no context)
+
+```bash
+python imitate_episodes.py \
+  --task_name sim_transfer_cube_scripted \
+  --ckpt_dir <ckpt_dir> \
+  --policy_class ACT \
+  --kl_weight 10 \
+  --chunk_size 100 \
+  --hidden_dim 512 \
+  --batch_size 8 \
+  --dim_feedforward 3200 \
+  --num_epochs 2000 \
+  --lr 1e-5 \
+  --seed 0
+```
+
+### With velocity observation
+
+Add `--velocity_control`. The model receives `[qpos; qvel]` as proprioceptive input at each timestep.
+
+```bash
+python imitate_episodes.py \
+  --task_name sim_transfer_cube_scripted \
+  --ckpt_dir <ckpt_dir> \
+  --policy_class ACT \
+  --kl_weight 10 \
+  --chunk_size 100 \
+  --hidden_dim 512 \
+  --batch_size 8 \
+  --dim_feedforward 3200 \
+  --num_epochs 2000 \
+  --lr 1e-5 \
+  --seed 0 \
+  --velocity_control
+```
+
+### With context history
+
+Set `--context_length` to the desired number of past timesteps. The observation fed to the policy at each step will be a window of that many consecutive frames.
+
+```bash
+python imitate_episodes.py \
+  --task_name sim_transfer_cube_scripted \
+  --ckpt_dir <ckpt_dir> \
+  --policy_class ACT \
+  --kl_weight 10 \
+  --chunk_size 100 \
+  --hidden_dim 512 \
+  --batch_size 8 \
+  --dim_feedforward 3200 \
+  --num_epochs 2000 \
+  --lr 1e-5 \
+  --seed 0 \
+  --context_length 5
+```
+
+### With both velocity and context
+
+```bash
+python imitate_episodes.py \
+  --task_name sim_transfer_cube_scripted \
+  --ckpt_dir <ckpt_dir> \
+  --policy_class ACT \
+  --kl_weight 10 \
+  --chunk_size 100 \
+  --hidden_dim 512 \
+  --batch_size 8 \
+  --dim_feedforward 3200 \
+  --num_epochs 2000 \
+  --lr 1e-5 \
+  --seed 0 \
+  --velocity_control \
+  --context_length 5
+```
+
+### Additional flags
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--velocity_control` | bool | off | Include joint velocities in the observation |
+| `--context_length` | int | 1 | Number of consecutive past timesteps in the observation |
+| `--image_aug` | bool | off | Apply stochastic colour jitter, blur, and crop augmentation |
+| `--temporal_agg` | bool | off | Use exponential temporal ensembling at inference |
+| `--dropout` | float | 0.1 | Dropout rate in the transformer |
+| `--pretrained` | str | None | Path to a checkpoint to initialise from |
+
+---
+
+## Evaluation
+
+Add `--eval` to load `policy_best.ckpt` and run 50 rollouts. The `qvel` preprocessing and context window are applied automatically based on the saved config.
+
+```bash
+python imitate_episodes.py \
+  --task_name sim_transfer_cube_scripted \
+  --ckpt_dir <ckpt_dir> \
+  --policy_class ACT \
+  --chunk_size 100 \
+  --hidden_dim 512 \
+  --batch_size 8 \
+  --dim_feedforward 3200 \
+  --num_epochs 2000 \
+  --lr 1e-5 \
+  --seed 0 \
+  --velocity_control \
+  --context_length 5 \
+  --eval
+```
+
+---
+
+## HDF5 data format
+
+The dataset loader expects a single HDF5 file with the following structure (as produced by the Isaac Lab data collection pipeline):
+
+```
+data/
+  demo_0/
+    actions                                      # (T, action_dim)
+    states/articulation/robot/joint_position     # (T, n_joints+1)  — last col unused
+    states/articulation/robot/joint_velocity     # (T, n_joints+1)  — last col unused
+    obs/
+      <camera_name>                              # (T, H, W, 3)  uint8 RGB
+      gripper_pos                                # (T, 1)  used for subtask label
+  demo_1/
+    ...
+```
+
+`joint_position` and `joint_velocity` have their last column stripped (`[:, :-1]`) before use.
+
+---
+
+## Repo structure
+
+```
+ACT_adapted/
+├── imitate_episodes.py      # Train / eval entry point
+├── policy.py                # ACTPolicy wrapper — qvel + context forwarding, beta KL schedule
+├── utils.py                 # EpisodicDataset with velocity + context, get_norm_stats, load_data
+├── ChunkedEpisodicDataset.py # Alternative dataset: fixed chunk pre-segmentation
+├── detr/                    # ACT model definition (DETR-based encoder-decoder)
+├── constants.py             # Task configs, shared constants
+├── sim_env.py               # MuJoCo joint-space simulation environments
+├── ee_sim_env.py            # MuJoCo EE-space simulation environments
+├── scripted_policy.py       # Scripted demo policies
+├── record_sim_episodes.py   # Collect and save demonstration episodes
+├── visualize_episodes.py    # Render saved episodes to video
+└── policy_runner.py         # Standalone inference runner
+```
+
+---
+
+## References
+
+- [Original ACT repository](https://github.com/tonyzhaozh/act)
+- [ACT project website](https://tonyzhaozh.github.io/aloha/)
+- [ACT tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing)
