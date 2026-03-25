@@ -176,27 +176,17 @@ python imitate_episodes.py \
 ---
 
 ## Evaluation
+Best option is to use the play_cvae.py scrip from:
 
-Add `--eval` to load `policy_best.ckpt` and run 50 rollouts. The `qvel` preprocessing and context window are applied automatically based on the saved config.
+    https://github.com/mschmotzer/Isaaaclab_MT_Michael
+using the command:
 
-```bash
-python imitate_episodes.py \
-  --task_name sim_transfer_cube_scripted \
-  --ckpt_dir <ckpt_dir> \
-  --policy_class ACT \
-  --chunk_size 100 \
-  --hidden_dim 512 \
-  --batch_size 8 \
-  --dim_feedforward 3200 \
-  --num_epochs 2000 \
-  --lr 1e-5 \
-  --seed 0 \
-  --velocity_control \
-  --context_length 5 \
-  --eval
-```
-
+    ./isaaclab.sh -p scripts/imitation_learning/robomimic/^Cay_cvae.py --device cuda --task Isaac-Stack-Cube-Franka-IK-Abs-Transformer-RGB-v0 --num_rollouts
+     100 --checkpoint /home/pdz/MasterThesis_MSC/Results_EUler/small_ws_simplified_400/policy_best.ckpt --enable_cameras --data_path /home/pdz/MasterThesis_MSC/Results_EUler/small_ws_400/
+     --velocity_control --context_length 4 --seed 1 --horizon 400 --action_length 12 --success_output_file_dir data_storage/successtest_adaption1
 ---
+"action_length" can have a mixmal length of action chunk size and if the numbers of actions ensembled in rollout.
+All this is for cube stacking, if other task used use the standart act replay modaliity.
 
 ## HDF5 data format
 
